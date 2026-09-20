@@ -161,141 +161,124 @@ function LiveCameraSlot({ index, camera, image, title, counts, onCrossing }: { i
   </div>;
 }
 
-const GRID_W = 128;
-const GRID_H = 72;
+type TrackBox = { id: number; x: number; y: number; w: number; h: number; confidence: number };
+type Track = { id: number; cx: number; cy: number; box: TrackBox; hits: number; missed: number; side: -1 | 1 | null; lastCross: number };
 
-type TrackBox = { id: number; x: number; y: number; w: number; h: number; confidence: number; face: { x: number; y: number; s: number } | null };
-type Track = { id: number; cx: number; cy: number; box: TrackBox; side: -1 | 1 | null; missed: number; lastCross: number };
+const MP_VERSION = "1.0.1";
+const MP_WASM = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/wasm`;
+const MP_MODEL = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite";
 
 function TrackedCameraFeed({ stream, image, title, onCrossing }: { stream: MediaStream | null; image: string; title: string; onCrossing: (direction: "in" | "out") => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const background = useRef<Float32Array | null>(null);
   const tracks = useRef<Track[]>([]);
   const nextId = useRef(1);
   const [boxes, setBoxes] = useState<TrackBox[]>([]);
+  const [status, setStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
 
   useEffect(() => { if (videoRef.current) videoRef.current.srcObject = stream; }, [stream]);
 
   useEffect(() => {
-    if (!stream) { setBoxes([]); return; }
+    if (!stream) { setBoxes([]); setStatus("idle"); tracks.current = []; return; }
+    let cancelled = false;
     let frame = 0;
+    let detector: { detectForVideo: (v: HTMLVideoElement, t: number) => { detections: unknown[] }; close: () => void } | null = null;
     let lastSample = 0;
-    const luma = new Float32Array(GRID_W * GRID_H);
-    const mask = new Uint8Array(GRID_W * GRID_H);
-    const labels = new Int32Array(GRID_W * GRID_H);
-    const queue = new Int32Array(GRID_W * GRID_H);
 
-    const track = (time: number) => {
-      frame = requestAnimationFrame(track);
+    setStatus("loading");
+    (async () => {
+      try {
+        // Real face detector (BlazeFace) — only human faces produce a box, so
+        // shelves, carts and lighting changes can no longer become "customers".
+        const vision = await import("@mediapipe/tasks-vision");
+        const files = await vision.FilesetResolver.forVisionTasks(MP_WASM);
+        const faceDetector = await vision.FaceDetector.createFromOptions(files, {
+          baseOptions: { modelAssetPath: MP_MODEL, delegate: "GPU" },
+          runningMode: "VIDEO",
+          minDetectionConfidence: 0.6,
+          minSuppressionThreshold: 0.3,
+        });
+        if (cancelled) { faceDetector.close(); return; }
+        detector = faceDetector as unknown as typeof detector;
+        setStatus("ready");
+        frame = requestAnimationFrame(loop);
+      } catch {
+        if (!cancelled) setStatus("error");
+      }
+    })();
+
+    const loop = (time: number) => {
+      frame = requestAnimationFrame(loop);
       const video = videoRef.current;
-      const canvas = canvasRef.current;
-      if (!video || !canvas || video.readyState < 2 || time - lastSample < 66) return;
+      if (!detector || !video || video.readyState < 2 || !video.videoWidth) return;
+      if (time - lastSample < 90) return; // ~11 fps inference keeps the UI smooth
       lastSample = time;
-      const context = canvas.getContext("2d", { willReadFrequently: true });
-      if (!context) return;
-      context.drawImage(video, 0, 0, GRID_W, GRID_H);
-      const pixels = context.getImageData(0, 0, GRID_W, GRID_H).data;
-      for (let p = 0; p < luma.length; p += 1) {
-        const i = p * 4;
-        luma[p] = 0.299 * pixels[i]! + 0.587 * pixels[i + 1]! + 0.114 * pixels[i + 2]!;
-      }
 
-      const model = background.current;
-      if (!model) { background.current = Float32Array.from(luma); return; }
+      let detections: { boundingBox?: { originX: number; originY: number; width: number; height: number }; categories?: { score: number }[] }[] = [];
+      try {
+        detections = detector.detectForVideo(video, time).detections as typeof detections;
+      } catch { return; }
 
-      // Adaptive background subtraction — tolerant of lighting drift, sensitive to bodies.
-      let moving = 0;
-      for (let p = 0; p < luma.length; p += 1) {
-        const hit = Math.abs(luma[p]! - model[p]!) > 16 ? 1 : 0;
-        mask[p] = hit;
-        moving += hit;
-      }
-      const ratio = moving / (GRID_W * GRID_H);
-      const valid = ratio > 0.008 && ratio < 0.6;
-      const learn = valid ? 0.02 : 0.12;
-      for (let p = 0; p < luma.length; p += 1) model[p] = model[p]! + (luma[p]! - model[p]!) * learn;
+      const vw = video.videoWidth, vh = video.videoHeight;
+      const found = detections
+        .map(d => ({ bb: d.boundingBox, score: d.categories?.[0]?.score ?? 0 }))
+        .filter(d => !!d.bb && d.score > 0.62)
+        .map(d => {
+          const bb = d.bb!;
+          // Expand the face box slightly into a head-and-shoulders box.
+          const w = (bb.width / vw) * 100 * 1.25;
+          const h = (bb.height / vh) * 100 * 1.35;
+          const x = (bb.originX / vw) * 100 - (w - (bb.width / vw) * 100) / 2;
+          const y = (bb.originY / vh) * 100 - (h - (bb.height / vh) * 100) / 2;
+          return { x, y, w, h, cx: x + w / 2, cy: y + h / 2, score: d.score };
+        })
+        .filter(d => d.w > 3 && d.h > 4); // ignore sub-pixel false positives
 
-      const detections: { cx: number; cy: number; box: TrackBox }[] = [];
-      if (valid) {
-        // Connected-component labelling separates each person into their own blob.
-        labels.fill(0);
-        let label = 0;
-        for (let start = 0; start < mask.length; start += 1) {
-          if (!mask[start] || labels[start]) continue;
-          label += 1;
-          let head = 0, tail = 0;
-          queue[tail++] = start; labels[start] = label;
-          let count = 0, sumX = 0, sumY = 0;
-          let minX = GRID_W, maxX = 0, minY = GRID_H, maxY = 0;
-          while (head < tail) {
-            const p = queue[head++]!;
-            const x = p % GRID_W;
-            const y = (p / GRID_W) | 0;
-            count += 1; sumX += x; sumY += y;
-            if (x < minX) minX = x; if (x > maxX) maxX = x;
-            if (y < minY) minY = y; if (y > maxY) maxY = y;
-            for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) {
-              const nx = x + dx, ny = y + dy;
-              if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
-              const np = ny * GRID_W + nx;
-              if (mask[np] && !labels[np]) { labels[np] = label; queue[tail++] = np; }
-            }
-          }
-          const w = maxX - minX + 1, h = maxY - minY + 1;
-          if (count < 45 || h < 8) continue; // noise / shadow flicker
-          // Skin-tone search in the upper third of the blob approximates the face.
-          let fx = 0, fy = 0, fn = 0;
-          const faceBottom = minY + Math.round(h * 0.45);
-          for (let y = minY; y <= faceBottom; y += 1) for (let x = minX; x <= maxX; x += 1) {
-            const i = (y * GRID_W + x) * 4;
-            const r = pixels[i]!, g = pixels[i + 1]!, b = pixels[i + 2]!;
-            if (r > 90 && g > 40 && b > 20 && r > g + 14 && r > b + 14) { fx += x; fy += y; fn += 1; }
-          }
-          detections.push({
-            cx: sumX / count,
-            cy: sumY / count,
-            box: {
-              id: 0,
-              x: (minX / GRID_W) * 100,
-              y: (minY / GRID_H) * 100,
-              w: (w / GRID_W) * 100,
-              h: (h / GRID_H) * 100,
-              confidence: Math.min(99, Math.round(55 + (count / (w * h)) * 45)),
-              face: fn > 12 ? { x: ((fx / fn) / GRID_W) * 100, y: ((fy / fn) / GRID_H) * 100, s: Math.max(6, (w / GRID_W) * 100 * 0.45) } : null,
-            },
-          });
-        }
-      }
-
-      // Nearest-neighbour matching keeps a stable customer number on each person.
+      // Nearest-neighbour matching keeps a stable customer number per face.
       const open = [...tracks.current];
       const live: Track[] = [];
-      for (const d of detections) {
-        let best: Track | null = null, bestDist = 18;
+      for (const d of found) {
+        let best: Track | null = null;
+        let bestDist = Math.max(12, d.w * 1.4);
         for (const t of open) {
           const dist = Math.hypot(t.cx - d.cx, t.cy - d.cy);
           if (dist < bestDist) { bestDist = dist; best = t; }
         }
+        const confidence = Math.round(d.score * 100);
         if (best) {
           open.splice(open.indexOf(best), 1);
-          best.cx += (d.cx - best.cx) * 0.4;
-          best.cy += (d.cy - best.cy) * 0.4;
-          best.box = { ...d.box, id: best.id };
+          // Smoothing on both position and size removes the box jitter.
+          const s = 0.4;
+          best.cx += (d.cx - best.cx) * s;
+          best.cy += (d.cy - best.cy) * s;
+          const b = best.box;
+          best.box = {
+            id: best.id,
+            x: b.x + (d.x - b.x) * s,
+            y: b.y + (d.y - b.y) * s,
+            w: b.w + (d.w - b.w) * s,
+            h: b.h + (d.h - b.h) * s,
+            confidence: Math.round(b.confidence + (confidence - b.confidence) * 0.3),
+          };
+          best.hits += 1;
           best.missed = 0;
           live.push(best);
         } else {
-          const id = nextId.current++;
-          live.push({ id, cx: d.cx, cy: d.cy, box: { ...d.box, id }, side: null, missed: 0, lastCross: 0 });
+          const id = nextId.current;
+          live.push({ id, cx: d.cx, cy: d.cy, box: { id, x: d.x, y: d.y, w: d.w, h: d.h, confidence }, hits: 1, missed: 0, side: null, lastCross: 0 });
         }
       }
-      for (const t of open) { t.missed += 1; if (t.missed < 10) live.push(t); }
+      // Keep briefly-lost faces alive so a blink or turn doesn't renumber them.
+      for (const t of open) { t.missed += 1; if (t.missed < 12) live.push(t); }
       tracks.current = live;
-      setBoxes(live.filter(t => t.missed === 0).map(t => t.box));
 
-      const center = GRID_W / 2;
-      const margin = GRID_W * 0.06; // hysteresis band around the tripwire
-      for (const t of live) {
+      // A track must be seen in 3 consecutive frames before it becomes a customer.
+      for (const t of live) if (t.hits === 3 && t.id === nextId.current) nextId.current += 1;
+      const confirmed = live.filter(t => t.hits >= 3 && t.missed < 5);
+      setBoxes(confirmed.map(t => t.box));
+
+      const center = 50;
+      const margin = 8; // hysteresis band around the tripwire
+      for (const t of confirmed) {
         if (t.missed > 0) continue;
         const currentSide: -1 | 1 | null = t.cx < center - margin ? -1 : t.cx > center + margin ? 1 : null;
         if (currentSide === null) continue;
@@ -308,19 +291,21 @@ function TrackedCameraFeed({ stream, image, title, onCrossing }: { stream: Media
       }
     };
 
-    frame = requestAnimationFrame(track);
     return () => {
+      cancelled = true;
       cancelAnimationFrame(frame);
-      background.current = null; tracks.current = [];
+      detector?.close();
+      tracks.current = [];
     };
   }, [stream, onCrossing]);
 
-  return <div className="relative aspect-video overflow-hidden rounded-sm bg-muted">{stream ? <video ref={videoRef} autoPlay playsInline muted className="h-full w-full object-cover"/> : <img src={image} alt={`${title} camera preview`} className="h-full w-full object-cover saturate-[.7]"/>}<canvas ref={canvasRef} width={GRID_W} height={GRID_H} className="hidden"/>
-    {boxes.map(b => <div key={b.id} className="absolute rounded-sm border-2 border-optimal shadow-[0_0_12px_hsl(var(--optimal)/0.35)] transition-all duration-100" style={{ left: `${b.x}%`, top: `${b.y}%`, width: `${b.w}%`, height: `${b.h}%` }}>
+  const statusLabel = !stream ? "CAMERA READY" : status === "loading" ? "LOADING FACE AI" : status === "error" ? "FACE AI UNAVAILABLE" : boxes.length ? `TRACKING ${boxes.length} PERSON${boxes.length > 1 ? "S" : ""}` : "SCANNING FOR FACES";
+
+  return <div className="relative aspect-video overflow-hidden rounded-sm bg-muted">{stream ? <video ref={videoRef} autoPlay playsInline muted className="h-full w-full object-cover"/> : <img src={image} alt={`${title} camera preview`} className="h-full w-full object-cover saturate-[.7]"/>}
+    {boxes.map(b => <div key={b.id} className="absolute rounded-sm border-2 border-optimal shadow-[0_0_12px_hsl(var(--optimal)/0.35)] transition-all duration-150 ease-out" style={{ left: `${b.x}%`, top: `${b.y}%`, width: `${b.w}%`, height: `${b.h}%` }}>
       <span className="absolute -top-4 left-0 whitespace-nowrap rounded-sm bg-optimal px-1 font-mono text-[8px] font-bold text-primary-foreground">CUSTOMER #{b.id} • {b.confidence}%</span>
-      {b.face && <span className="absolute rounded-sm border border-optimal/80" style={{ left: `${((b.face.x - b.x) / b.w) * 100 - (b.face.s / b.w) * 50}%`, top: `${((b.face.y - b.y) / b.h) * 100 - (b.face.s / b.h) * 50}%`, width: `${(b.face.s / b.w) * 100}%`, height: `${(b.face.s / b.h) * 100}%` }}/>}
     </div>)}
-    <div className="absolute inset-y-0 left-1/2 border-l-2 border-dashed border-warning"><span className="absolute left-1 top-2 whitespace-nowrap rounded-sm bg-warning px-1.5 py-1 font-mono text-[8px] font-bold text-primary-foreground">AI TRIPWIRE</span></div><div className="absolute inset-x-0 bottom-0 flex justify-between bg-foreground/70 px-2 py-1.5 text-[9px] font-bold text-primary-foreground"><span>{title}</span><span>{stream ? (boxes.length ? `TRACKING ${boxes.length} PERSON${boxes.length > 1 ? "S" : ""}` : "SCENE CALIBRATED") : "CAMERA READY"}</span></div></div>;
+    <div className="absolute inset-y-0 left-1/2 border-l-2 border-dashed border-warning"><span className="absolute left-1 top-2 whitespace-nowrap rounded-sm bg-warning px-1.5 py-1 font-mono text-[8px] font-bold text-primary-foreground">AI TRIPWIRE</span></div><div className="absolute inset-x-0 bottom-0 flex justify-between bg-foreground/70 px-2 py-1.5 text-[9px] font-bold text-primary-foreground"><span>{title}</span><span>{statusLabel}</span></div></div>;
 }
 
 function CameraFeed({ image, title, tag, boxes, critical = false, stream = null }: { image: string; title: string; tag: string; boxes: number; critical?: boolean; stream?: MediaStream | null }) {

@@ -206,7 +206,7 @@ function TrackedCameraFeed({ stream, image, title, onCrossing }: { stream: Media
       }
     })();
 
-    const loop = (time: number) => {
+    function loop(time: number) {
       frame = requestAnimationFrame(loop);
       const video = videoRef.current;
       if (!detector || !video || video.readyState < 2 || !video.videoWidth) return;

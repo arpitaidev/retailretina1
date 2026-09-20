@@ -161,52 +161,111 @@ function LiveCameraSlot({ index, camera, image, title, counts, onCrossing }: { i
   </div>;
 }
 
+const GRID_W = 128;
+const GRID_H = 72;
+
+type TrackBox = { x: number; y: number; w: number; h: number; confidence: number };
+
 function TrackedCameraFeed({ stream, image, title, onCrossing }: { stream: MediaStream | null; image: string; title: string; onCrossing: (direction: "in" | "out") => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const previousFrame = useRef<Uint8ClampedArray | null>(null);
-  const previousCenter = useRef<number | null>(null);
+  const background = useRef<Float32Array | null>(null);
+  const smoothed = useRef<{ x: number; y: number } | null>(null);
+  const side = useRef<-1 | 1 | null>(null);
+  const missed = useRef(0);
   const lastCrossing = useRef(0);
+  const [box, setBox] = useState<TrackBox | null>(null);
+
   useEffect(() => { if (videoRef.current) videoRef.current.srcObject = stream; }, [stream]);
+
   useEffect(() => {
-    if (!stream) return;
+    if (!stream) { setBox(null); return; }
     let frame = 0;
     let lastSample = 0;
+    const luma = new Float32Array(GRID_W * GRID_H);
+
     const track = (time: number) => {
+      frame = requestAnimationFrame(track);
       const video = videoRef.current;
       const canvas = canvasRef.current;
-      if (video && canvas && video.readyState >= 2 && time - lastSample > 180) {
-        lastSample = time;
-        const context = canvas.getContext("2d", { willReadFrequently: true });
-        if (context) {
-          context.drawImage(video, 0, 0, 96, 54);
-          const pixels = context.getImageData(0, 0, 96, 54).data;
-          const prior = previousFrame.current;
-          if (prior) {
-            let weightedX = 0; let moving = 0;
-            for (let i = 0; i < pixels.length; i += 16) {
-              const difference = Math.abs(pixels[i]! - prior[i]!) + Math.abs(pixels[i + 1]! - prior[i + 1]!) + Math.abs(pixels[i + 2]! - prior[i + 2]!);
-              if (difference > 85) { weightedX += (i / 4 % 96); moving += 1; }
-            }
-            if (moving > 45) {
-              const center = weightedX / moving;
-              const before = previousCenter.current;
-              if (before !== null && time - lastCrossing.current > 1500) {
-                if (before < 43 && center > 53) { onCrossing("in"); lastCrossing.current = time; }
-                if (before > 53 && center < 43) { onCrossing("out"); lastCrossing.current = time; }
-              }
-              previousCenter.current = center;
-            }
-          }
-          previousFrame.current = new Uint8ClampedArray(pixels);
+      if (!video || !canvas || video.readyState < 2 || time - lastSample < 66) return;
+      lastSample = time;
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      if (!context) return;
+      context.drawImage(video, 0, 0, GRID_W, GRID_H);
+      const pixels = context.getImageData(0, 0, GRID_W, GRID_H).data;
+      for (let p = 0; p < luma.length; p += 1) {
+        const i = p * 4;
+        luma[p] = 0.299 * pixels[i]! + 0.587 * pixels[i + 1]! + 0.114 * pixels[i + 2]!;
+      }
+
+      const model = background.current;
+      if (!model) { background.current = Float32Array.from(luma); return; }
+
+      // Adaptive background subtraction — tolerant of lighting drift, sensitive to bodies.
+      let sumX = 0, sumY = 0, moving = 0;
+      let minX = GRID_W, maxX = 0, minY = GRID_H, maxY = 0;
+      for (let p = 0; p < luma.length; p += 1) {
+        if (Math.abs(luma[p]! - model[p]!) > 18) {
+          const x = p % GRID_W;
+          const y = (p / GRID_W) | 0;
+          sumX += x; sumY += y; moving += 1;
+          if (x < minX) minX = x; if (x > maxX) maxX = x;
+          if (y < minY) minY = y; if (y > maxY) maxY = y;
         }
       }
-      frame = requestAnimationFrame(track);
+
+      const area = GRID_W * GRID_H;
+      const ratio = moving / area;
+      // Ignore sensor noise (too little) and global light/camera shake (too much).
+      const valid = ratio > 0.012 && ratio < 0.55;
+      const learn = valid ? 0.02 : 0.12;
+      for (let p = 0; p < luma.length; p += 1) model[p] = model[p]! + (luma[p]! - model[p]!) * learn;
+
+      if (!valid) {
+        missed.current += 1;
+        if (missed.current > 12) { smoothed.current = null; side.current = null; setBox(null); }
+        return;
+      }
+      missed.current = 0;
+
+      const rawX = sumX / moving;
+      const rawY = sumY / moving;
+      const previous = smoothed.current;
+      // Exponential smoothing removes jitter so the tripwire only fires on real travel.
+      const next = previous ? { x: previous.x + (rawX - previous.x) * 0.35, y: previous.y + (rawY - previous.y) * 0.35 } : { x: rawX, y: rawY };
+      smoothed.current = next;
+
+      setBox({
+        x: (minX / GRID_W) * 100,
+        y: (minY / GRID_H) * 100,
+        w: ((maxX - minX + 1) / GRID_W) * 100,
+        h: ((maxY - minY + 1) / GRID_H) * 100,
+        confidence: Math.min(99, Math.round(40 + ratio * 160)),
+      });
+
+      const center = GRID_W / 2;
+      const margin = GRID_W * 0.06; // hysteresis band around the tripwire
+      const currentSide: -1 | 1 | null = next.x < center - margin ? -1 : next.x > center + margin ? 1 : null;
+      if (currentSide === null) return;
+      const before = side.current;
+      side.current = currentSide;
+      if (before === null || before === currentSide) return;
+      if (time - lastCrossing.current < 900) return;
+      lastCrossing.current = time;
+      onCrossing(currentSide === 1 ? "in" : "out");
     };
+
     frame = requestAnimationFrame(track);
-    return () => { cancelAnimationFrame(frame); previousFrame.current = null; previousCenter.current = null; };
+    return () => {
+      cancelAnimationFrame(frame);
+      background.current = null; smoothed.current = null; side.current = null; missed.current = 0;
+    };
   }, [stream, onCrossing]);
-  return <div className="relative aspect-video overflow-hidden rounded-sm bg-muted">{stream ? <video ref={videoRef} autoPlay playsInline muted className="h-full w-full object-cover"/> : <img src={image} alt={`${title} camera preview`} className="h-full w-full object-cover saturate-[.7]"/>}<canvas ref={canvasRef} width="96" height="54" className="hidden"/><div className="absolute inset-y-0 left-1/2 border-l-2 border-dashed border-warning"><span className="absolute left-1 top-2 whitespace-nowrap rounded-sm bg-warning px-1.5 py-1 font-mono text-[8px] font-bold text-primary-foreground">AI TRIPWIRE</span></div><div className="absolute inset-x-0 bottom-0 flex justify-between bg-foreground/70 px-2 py-1.5 text-[9px] font-bold text-primary-foreground"><span>{title}</span><span>{stream ? "TRACKING LIVE" : "CAMERA READY"}</span></div></div>;
+
+  return <div className="relative aspect-video overflow-hidden rounded-sm bg-muted">{stream ? <video ref={videoRef} autoPlay playsInline muted className="h-full w-full object-cover"/> : <img src={image} alt={`${title} camera preview`} className="h-full w-full object-cover saturate-[.7]"/>}<canvas ref={canvasRef} width={GRID_W} height={GRID_H} className="hidden"/>
+    {box && <div className="absolute border-2 border-optimal transition-all duration-100" style={{ left: `${box.x}%`, top: `${box.y}%`, width: `${box.w}%`, height: `${box.h}%` }}><span className="absolute -top-4 left-0 bg-optimal px-1 font-mono text-[8px] text-primary-foreground">TRACK {box.confidence}%</span></div>}
+    <div className="absolute inset-y-0 left-1/2 border-l-2 border-dashed border-warning"><span className="absolute left-1 top-2 whitespace-nowrap rounded-sm bg-warning px-1.5 py-1 font-mono text-[8px] font-bold text-primary-foreground">AI TRIPWIRE</span></div><div className="absolute inset-x-0 bottom-0 flex justify-between bg-foreground/70 px-2 py-1.5 text-[9px] font-bold text-primary-foreground"><span>{title}</span><span>{stream ? (box ? "TRACKING LIVE" : "SCENE CALIBRATED") : "CAMERA READY"}</span></div></div>;
 }
 
 function CameraFeed({ image, title, tag, boxes, critical = false, stream = null }: { image: string; title: string; tag: string; boxes: number; critical?: boolean; stream?: MediaStream | null }) {
@@ -390,8 +449,8 @@ function Architecture() {
 function FlowNode({ icon: Icon, title, detail, highlight, good }: { icon: Icon; title: string; detail: string; highlight?: boolean; good?: boolean }) { return <div className={`flex min-h-36 flex-col items-center justify-center rounded-md border p-4 text-center ${highlight ? "border-insight/40 bg-insight-soft" : good ? "border-optimal/40 bg-optimal-soft" : "border-border bg-background"}`}><Icon className={`mb-3 size-8 ${highlight ? "text-insight" : good ? "text-optimal" : "text-muted-foreground"}`}/><div className="text-sm font-extrabold">{title}</div><div className="mt-1 text-[11px] text-muted-foreground">{detail}</div></div>; }
 function FlowArrow() { return <div className="flex items-center justify-center"><ArrowUpRight className="size-5 rotate-45 text-muted-foreground md:rotate-0"/></div>; }
 function MetricGauge({ value, max, suffix, label, note }: { value: number; max: number; suffix: string; label: string; note: string }) { const pct = Math.round(value/max*100); return <div className="rounded-md border border-border bg-card p-5"><div className="flex items-center justify-between"><CircleGauge className="size-6 text-insight"/><span className="font-mono text-[10px] text-optimal">OPTIMAL</span></div><div className="mt-5 text-3xl font-extrabold">{value}<span className="text-base text-muted-foreground">{suffix}</span></div><div className="mt-1 text-sm font-bold">{label}</div><div className="text-[10px] text-muted-foreground">{note}</div><div className="mt-4 h-1.5 rounded-full bg-muted"><div className="h-full rounded-full bg-insight" style={{ width: `${pct}%` }}/></div></div>; }
-const hourlyTraffic = [88,142,210,268,312,405,468,392,301,356,470,388,244,150];
-const hourLabels = ["9a","10a","11a","12p","1p","2p","3p","4p","5p","6p","7p","8p","9p","10p"];
+const hourlyTraffic = [52,88,142,210,268,312,405,468,392,301,356,470,388,244,150,96];
+const hourLabels = ["8a","9a","10a","11a","12p","1p","2p","3p","4p","5p","6p","7p","8p","9p","10p","11p"];
 const weekdayTraffic = [["Mon",1980],["Tue",2140],["Wed",2260],["Thu",2480],["Fri",3120],["Sat",3860],["Sun",3410]] as const;
 const riskItems = [
   ["Organic Whole Milk 1L", "SKU 41987", 46, 22, 3],
@@ -416,7 +475,7 @@ function TrafficStaffing({ rush, activeShoppers }: { rush: boolean; activeShoppe
     </div>
     <div className="rounded-md border border-border bg-card p-4">
       <SectionTitle icon={BarChart3} title="Hourly Footfall" note="Shoppers entering per hour, edge-counted"/>
-      <div className="flex h-48 items-end gap-2">{traffic.map((v, i) => <div key={hourLabels[i]} className="flex flex-1 flex-col items-center gap-2"><div className={`w-full rounded-t-sm ${i === peakIndex ? "bg-critical" : v > maxTraffic * 0.7 ? "bg-warning" : "bg-insight"}`} style={{ height: `${(v / maxTraffic) * 100}%` }} title={`${v} shoppers`}/><span className="text-[9px] text-muted-foreground">{hourLabels[i]}</span></div>)}</div>
+      <div className="flex h-56 items-stretch gap-2">{traffic.map((v, i) => <div key={hourLabels[i]} className="flex h-full flex-1 flex-col items-center gap-1"><span className="font-mono text-[9px] text-muted-foreground">{v}</span><div className="relative w-full flex-1"><div className={`absolute inset-x-0 bottom-0 rounded-t-sm ${i === peakIndex ? "bg-critical" : v > maxTraffic * 0.7 ? "bg-warning" : "bg-insight"}`} style={{ height: `${Math.max(4, (v / maxTraffic) * 100)}%` }} title={`${v} shoppers`}/></div><span className="text-[9px] text-muted-foreground">{hourLabels[i]}</span></div>)}</div>
     </div>
     <div className="grid gap-4 xl:grid-cols-2">
       <div className="rounded-md border border-border bg-card p-4">

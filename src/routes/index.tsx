@@ -475,7 +475,7 @@ function TrafficStaffing({ rush, activeShoppers }: { rush: boolean; activeShoppe
     </div>
     <div className="rounded-md border border-border bg-card p-4">
       <SectionTitle icon={BarChart3} title="Hourly Footfall" note="Shoppers entering per hour, edge-counted"/>
-      <div className="flex h-48 items-end gap-2">{traffic.map((v, i) => <div key={hourLabels[i]} className="flex flex-1 flex-col items-center gap-2"><div className={`w-full rounded-t-sm ${i === peakIndex ? "bg-critical" : v > maxTraffic * 0.7 ? "bg-warning" : "bg-insight"}`} style={{ height: `${(v / maxTraffic) * 100}%` }} title={`${v} shoppers`}/><span className="text-[9px] text-muted-foreground">{hourLabels[i]}</span></div>)}</div>
+      <div className="flex h-56 items-stretch gap-2">{traffic.map((v, i) => <div key={hourLabels[i]} className="flex h-full flex-1 flex-col items-center gap-1"><span className="font-mono text-[9px] text-muted-foreground">{v}</span><div className="relative w-full flex-1"><div className={`absolute inset-x-0 bottom-0 rounded-t-sm ${i === peakIndex ? "bg-critical" : v > maxTraffic * 0.7 ? "bg-warning" : "bg-insight"}`} style={{ height: `${Math.max(4, (v / maxTraffic) * 100)}%` }} title={`${v} shoppers`}/></div><span className="text-[9px] text-muted-foreground">{hourLabels[i]}</span></div>)}</div>
     </div>
     <div className="grid gap-4 xl:grid-cols-2">
       <div className="rounded-md border border-border bg-card p-4">

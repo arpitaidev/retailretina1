@@ -450,6 +450,14 @@ function FlowNode({ icon: Icon, title, detail, highlight, good }: { icon: Icon; 
 function FlowArrow() { return <div className="flex items-center justify-center"><ArrowUpRight className="size-5 rotate-45 text-muted-foreground md:rotate-0"/></div>; }
 function MetricGauge({ value, max, suffix, label, note }: { value: number; max: number; suffix: string; label: string; note: string }) { const pct = Math.round(value/max*100); return <div className="rounded-md border border-border bg-card p-5"><div className="flex items-center justify-between"><CircleGauge className="size-6 text-insight"/><span className="font-mono text-[10px] text-optimal">OPTIMAL</span></div><div className="mt-5 text-3xl font-extrabold">{value}<span className="text-base text-muted-foreground">{suffix}</span></div><div className="mt-1 text-sm font-bold">{label}</div><div className="text-[10px] text-muted-foreground">{note}</div><div className="mt-4 h-1.5 rounded-full bg-muted"><div className="h-full rounded-full bg-insight" style={{ width: `${pct}%` }}/></div></div>; }
 const hourlyTraffic = [52,88,142,210,268,312,405,468,392,301,356,470,388,244,150,96];
+// Low traffic = green, mid = amber, high = red.
+function trafficColor(t: number) {
+  const k = Math.min(1, Math.max(0, t));
+  const hue = 145 - 145 * Math.pow(k, 0.85);
+  const sat = 62 + 24 * k;
+  const light = 44 - 4 * k;
+  return `hsl(${hue.toFixed(0)} ${sat.toFixed(0)}% ${light.toFixed(0)}%)`;
+}
 const hourLabels = ["8a","9a","10a","11a","12p","1p","2p","3p","4p","5p","6p","7p","8p","9p","10p","11p"];
 const weekdayTraffic = [["Mon",1980],["Tue",2140],["Wed",2260],["Thu",2480],["Fri",3120],["Sat",3860],["Sun",3410]] as const;
 const riskItems = [

@@ -191,12 +191,14 @@ function TrackedCameraFeed({ stream, image, title, onCrossing }: { stream: Media
         // shelves, carts and lighting changes can no longer become "customers".
         const vision = await import("@mediapipe/tasks-vision");
         const files = await vision.FilesetResolver.forVisionTasks(MP_WASM);
-        const faceDetector = await vision.FaceDetector.createFromOptions(files, {
-          baseOptions: { modelAssetPath: MP_MODEL, delegate: "GPU" },
+        const create = (delegate: "GPU" | "CPU") => vision.FaceDetector.createFromOptions(files, {
+          baseOptions: { modelAssetPath: MP_MODEL, delegate },
           runningMode: "VIDEO",
           minDetectionConfidence: 0.6,
           minSuppressionThreshold: 0.3,
         });
+        // Fall back to CPU inference on machines without WebGL access.
+        const faceDetector = await create("GPU").catch(() => create("CPU"));
         if (cancelled) { faceDetector.close(); return; }
         detector = faceDetector as unknown as typeof detector;
         setStatus("ready");

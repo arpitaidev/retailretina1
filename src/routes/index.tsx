@@ -289,7 +289,7 @@ function TrackedCameraFeed({ stream, image, title, onCrossing }: { stream: Media
         t.lastCross = time;
         onCrossing(currentSide === 1 ? "in" : "out");
       }
-    };
+    }
 
     return () => {
       cancelled = true;

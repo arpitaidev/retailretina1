@@ -164,25 +164,27 @@ function LiveCameraSlot({ index, camera, image, title, counts, onCrossing }: { i
 const GRID_W = 128;
 const GRID_H = 72;
 
-type TrackBox = { x: number; y: number; w: number; h: number; confidence: number };
+type TrackBox = { id: number; x: number; y: number; w: number; h: number; confidence: number; face: { x: number; y: number; s: number } | null };
+type Track = { id: number; cx: number; cy: number; box: TrackBox; side: -1 | 1 | null; missed: number; lastCross: number };
 
 function TrackedCameraFeed({ stream, image, title, onCrossing }: { stream: MediaStream | null; image: string; title: string; onCrossing: (direction: "in" | "out") => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const background = useRef<Float32Array | null>(null);
-  const smoothed = useRef<{ x: number; y: number } | null>(null);
-  const side = useRef<-1 | 1 | null>(null);
-  const missed = useRef(0);
-  const lastCrossing = useRef(0);
-  const [box, setBox] = useState<TrackBox | null>(null);
+  const tracks = useRef<Track[]>([]);
+  const nextId = useRef(1);
+  const [boxes, setBoxes] = useState<TrackBox[]>([]);
 
   useEffect(() => { if (videoRef.current) videoRef.current.srcObject = stream; }, [stream]);
 
   useEffect(() => {
-    if (!stream) { setBox(null); return; }
+    if (!stream) { setBoxes([]); return; }
     let frame = 0;
     let lastSample = 0;
     const luma = new Float32Array(GRID_W * GRID_H);
+    const mask = new Uint8Array(GRID_W * GRID_H);
+    const labels = new Int32Array(GRID_W * GRID_H);
+    const queue = new Int32Array(GRID_W * GRID_H);
 
     const track = (time: number) => {
       frame = requestAnimationFrame(track);
@@ -203,69 +205,122 @@ function TrackedCameraFeed({ stream, image, title, onCrossing }: { stream: Media
       if (!model) { background.current = Float32Array.from(luma); return; }
 
       // Adaptive background subtraction — tolerant of lighting drift, sensitive to bodies.
-      let sumX = 0, sumY = 0, moving = 0;
-      let minX = GRID_W, maxX = 0, minY = GRID_H, maxY = 0;
+      let moving = 0;
       for (let p = 0; p < luma.length; p += 1) {
-        if (Math.abs(luma[p]! - model[p]!) > 18) {
-          const x = p % GRID_W;
-          const y = (p / GRID_W) | 0;
-          sumX += x; sumY += y; moving += 1;
-          if (x < minX) minX = x; if (x > maxX) maxX = x;
-          if (y < minY) minY = y; if (y > maxY) maxY = y;
-        }
+        const hit = Math.abs(luma[p]! - model[p]!) > 16 ? 1 : 0;
+        mask[p] = hit;
+        moving += hit;
       }
-
-      const area = GRID_W * GRID_H;
-      const ratio = moving / area;
-      // Ignore sensor noise (too little) and global light/camera shake (too much).
-      const valid = ratio > 0.012 && ratio < 0.55;
+      const ratio = moving / (GRID_W * GRID_H);
+      const valid = ratio > 0.008 && ratio < 0.6;
       const learn = valid ? 0.02 : 0.12;
       for (let p = 0; p < luma.length; p += 1) model[p] = model[p]! + (luma[p]! - model[p]!) * learn;
 
-      if (!valid) {
-        missed.current += 1;
-        if (missed.current > 12) { smoothed.current = null; side.current = null; setBox(null); }
-        return;
+      const detections: { cx: number; cy: number; box: TrackBox }[] = [];
+      if (valid) {
+        // Connected-component labelling separates each person into their own blob.
+        labels.fill(0);
+        let label = 0;
+        for (let start = 0; start < mask.length; start += 1) {
+          if (!mask[start] || labels[start]) continue;
+          label += 1;
+          let head = 0, tail = 0;
+          queue[tail++] = start; labels[start] = label;
+          let count = 0, sumX = 0, sumY = 0;
+          let minX = GRID_W, maxX = 0, minY = GRID_H, maxY = 0;
+          while (head < tail) {
+            const p = queue[head++]!;
+            const x = p % GRID_W;
+            const y = (p / GRID_W) | 0;
+            count += 1; sumX += x; sumY += y;
+            if (x < minX) minX = x; if (x > maxX) maxX = x;
+            if (y < minY) minY = y; if (y > maxY) maxY = y;
+            for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) {
+              const nx = x + dx, ny = y + dy;
+              if (nx < 0 || ny < 0 || nx >= GRID_W || ny >= GRID_H) continue;
+              const np = ny * GRID_W + nx;
+              if (mask[np] && !labels[np]) { labels[np] = label; queue[tail++] = np; }
+            }
+          }
+          const w = maxX - minX + 1, h = maxY - minY + 1;
+          if (count < 45 || h < 8) continue; // noise / shadow flicker
+          // Skin-tone search in the upper third of the blob approximates the face.
+          let fx = 0, fy = 0, fn = 0;
+          const faceBottom = minY + Math.round(h * 0.45);
+          for (let y = minY; y <= faceBottom; y += 1) for (let x = minX; x <= maxX; x += 1) {
+            const i = (y * GRID_W + x) * 4;
+            const r = pixels[i]!, g = pixels[i + 1]!, b = pixels[i + 2]!;
+            if (r > 90 && g > 40 && b > 20 && r > g + 14 && r > b + 14) { fx += x; fy += y; fn += 1; }
+          }
+          detections.push({
+            cx: sumX / count,
+            cy: sumY / count,
+            box: {
+              id: 0,
+              x: (minX / GRID_W) * 100,
+              y: (minY / GRID_H) * 100,
+              w: (w / GRID_W) * 100,
+              h: (h / GRID_H) * 100,
+              confidence: Math.min(99, Math.round(55 + (count / (w * h)) * 45)),
+              face: fn > 12 ? { x: ((fx / fn) / GRID_W) * 100, y: ((fy / fn) / GRID_H) * 100, s: Math.max(6, (w / GRID_W) * 100 * 0.45) } : null,
+            },
+          });
+        }
       }
-      missed.current = 0;
 
-      const rawX = sumX / moving;
-      const rawY = sumY / moving;
-      const previous = smoothed.current;
-      // Exponential smoothing removes jitter so the tripwire only fires on real travel.
-      const next = previous ? { x: previous.x + (rawX - previous.x) * 0.35, y: previous.y + (rawY - previous.y) * 0.35 } : { x: rawX, y: rawY };
-      smoothed.current = next;
-
-      setBox({
-        x: (minX / GRID_W) * 100,
-        y: (minY / GRID_H) * 100,
-        w: ((maxX - minX + 1) / GRID_W) * 100,
-        h: ((maxY - minY + 1) / GRID_H) * 100,
-        confidence: Math.min(99, Math.round(40 + ratio * 160)),
-      });
+      // Nearest-neighbour matching keeps a stable customer number on each person.
+      const open = [...tracks.current];
+      const live: Track[] = [];
+      for (const d of detections) {
+        let best: Track | null = null, bestDist = 18;
+        for (const t of open) {
+          const dist = Math.hypot(t.cx - d.cx, t.cy - d.cy);
+          if (dist < bestDist) { bestDist = dist; best = t; }
+        }
+        if (best) {
+          open.splice(open.indexOf(best), 1);
+          best.cx += (d.cx - best.cx) * 0.4;
+          best.cy += (d.cy - best.cy) * 0.4;
+          best.box = { ...d.box, id: best.id };
+          best.missed = 0;
+          live.push(best);
+        } else {
+          const id = nextId.current++;
+          live.push({ id, cx: d.cx, cy: d.cy, box: { ...d.box, id }, side: null, missed: 0, lastCross: 0 });
+        }
+      }
+      for (const t of open) { t.missed += 1; if (t.missed < 10) live.push(t); }
+      tracks.current = live;
+      setBoxes(live.filter(t => t.missed === 0).map(t => t.box));
 
       const center = GRID_W / 2;
       const margin = GRID_W * 0.06; // hysteresis band around the tripwire
-      const currentSide: -1 | 1 | null = next.x < center - margin ? -1 : next.x > center + margin ? 1 : null;
-      if (currentSide === null) return;
-      const before = side.current;
-      side.current = currentSide;
-      if (before === null || before === currentSide) return;
-      if (time - lastCrossing.current < 900) return;
-      lastCrossing.current = time;
-      onCrossing(currentSide === 1 ? "in" : "out");
+      for (const t of live) {
+        if (t.missed > 0) continue;
+        const currentSide: -1 | 1 | null = t.cx < center - margin ? -1 : t.cx > center + margin ? 1 : null;
+        if (currentSide === null) continue;
+        const before = t.side;
+        t.side = currentSide;
+        if (before === null || before === currentSide) continue;
+        if (time - t.lastCross < 900) continue;
+        t.lastCross = time;
+        onCrossing(currentSide === 1 ? "in" : "out");
+      }
     };
 
     frame = requestAnimationFrame(track);
     return () => {
       cancelAnimationFrame(frame);
-      background.current = null; smoothed.current = null; side.current = null; missed.current = 0;
+      background.current = null; tracks.current = [];
     };
   }, [stream, onCrossing]);
 
   return <div className="relative aspect-video overflow-hidden rounded-sm bg-muted">{stream ? <video ref={videoRef} autoPlay playsInline muted className="h-full w-full object-cover"/> : <img src={image} alt={`${title} camera preview`} className="h-full w-full object-cover saturate-[.7]"/>}<canvas ref={canvasRef} width={GRID_W} height={GRID_H} className="hidden"/>
-    {box && <div className="absolute border-2 border-optimal transition-all duration-100" style={{ left: `${box.x}%`, top: `${box.y}%`, width: `${box.w}%`, height: `${box.h}%` }}><span className="absolute -top-4 left-0 bg-optimal px-1 font-mono text-[8px] text-primary-foreground">TRACK {box.confidence}%</span></div>}
-    <div className="absolute inset-y-0 left-1/2 border-l-2 border-dashed border-warning"><span className="absolute left-1 top-2 whitespace-nowrap rounded-sm bg-warning px-1.5 py-1 font-mono text-[8px] font-bold text-primary-foreground">AI TRIPWIRE</span></div><div className="absolute inset-x-0 bottom-0 flex justify-between bg-foreground/70 px-2 py-1.5 text-[9px] font-bold text-primary-foreground"><span>{title}</span><span>{stream ? (box ? "TRACKING LIVE" : "SCENE CALIBRATED") : "CAMERA READY"}</span></div></div>;
+    {boxes.map(b => <div key={b.id} className="absolute rounded-sm border-2 border-optimal shadow-[0_0_12px_hsl(var(--optimal)/0.35)] transition-all duration-100" style={{ left: `${b.x}%`, top: `${b.y}%`, width: `${b.w}%`, height: `${b.h}%` }}>
+      <span className="absolute -top-4 left-0 whitespace-nowrap rounded-sm bg-optimal px-1 font-mono text-[8px] font-bold text-primary-foreground">CUSTOMER #{b.id} • {b.confidence}%</span>
+      {b.face && <span className="absolute rounded-sm border border-optimal/80" style={{ left: `${((b.face.x - b.x) / b.w) * 100 - (b.face.s / b.w) * 50}%`, top: `${((b.face.y - b.y) / b.h) * 100 - (b.face.s / b.h) * 50}%`, width: `${(b.face.s / b.w) * 100}%`, height: `${(b.face.s / b.h) * 100}%` }}/>}
+    </div>)}
+    <div className="absolute inset-y-0 left-1/2 border-l-2 border-dashed border-warning"><span className="absolute left-1 top-2 whitespace-nowrap rounded-sm bg-warning px-1.5 py-1 font-mono text-[8px] font-bold text-primary-foreground">AI TRIPWIRE</span></div><div className="absolute inset-x-0 bottom-0 flex justify-between bg-foreground/70 px-2 py-1.5 text-[9px] font-bold text-primary-foreground"><span>{title}</span><span>{stream ? (boxes.length ? `TRACKING ${boxes.length} PERSON${boxes.length > 1 ? "S" : ""}` : "SCENE CALIBRATED") : "CAMERA READY"}</span></div></div>;
 }
 
 function CameraFeed({ image, title, tag, boxes, critical = false, stream = null }: { image: string; title: string; tag: string; boxes: number; critical?: boolean; stream?: MediaStream | null }) {

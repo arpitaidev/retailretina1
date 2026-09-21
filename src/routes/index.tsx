@@ -162,7 +162,13 @@ function LiveCameraSlot({ index, camera, image, title, counts, onCrossing }: { i
 }
 
 type TrackBox = { id: number; x: number; y: number; w: number; h: number; confidence: number };
-type Track = { id: number; cx: number; cy: number; box: TrackBox; hits: number; missed: number; side: -1 | 1 | null; lastCross: number };
+type FaceBox = { x: number; y: number; w: number; h: number; cx: number; cy: number; score: number };
+type Track = { uid: number; customerId: number | null; cx: number; cy: number; vx: number; vy: number; box: Omit<TrackBox, "id">; streak: number; age: number; missed: number; quality: number; side: -1 | 1 | null; lastCross: number };
+
+function boxOverlap(a: Pick<FaceBox, "x" | "y" | "w" | "h">, b: Pick<FaceBox, "x" | "y" | "w" | "h">) {
+  const area = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)) * Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+  return area / Math.max(1, a.w * a.h + b.w * b.h - area);
+}
 
 const MP_VERSION = "1.0.1";
 const MP_WASM = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/wasm`;
@@ -171,11 +177,14 @@ const MP_MODEL = "https://storage.googleapis.com/mediapipe-models/face_detector/
 function TrackedCameraFeed({ stream, image, title, onCrossing }: { stream: MediaStream | null; image: string; title: string; onCrossing: (direction: "in" | "out") => void }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const tracks = useRef<Track[]>([]);
-  const nextId = useRef(1);
+  const nextTrackUid = useRef(1);
+  const nextCustomerId = useRef(1);
+  const crossingHandler = useRef(onCrossing);
   const [boxes, setBoxes] = useState<TrackBox[]>([]);
   const [status, setStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
 
   useEffect(() => { if (videoRef.current) videoRef.current.srcObject = stream; }, [stream]);
+  useEffect(() => { crossingHandler.current = onCrossing; }, [onCrossing]);
 
   useEffect(() => {
     if (!stream) { setBoxes([]); setStatus("idle"); tracks.current = []; return; }
@@ -194,8 +203,8 @@ function TrackedCameraFeed({ stream, image, title, onCrossing }: { stream: Media
         const create = (delegate: "GPU" | "CPU") => vision.FaceDetector.createFromOptions(files, {
           baseOptions: { modelAssetPath: MP_MODEL, delegate },
           runningMode: "VIDEO",
-          minDetectionConfidence: 0.6,
-          minSuppressionThreshold: 0.3,
+          minDetectionConfidence: 0.68,
+          minSuppressionThreshold: 0.45,
         });
         // Fall back to CPU inference on machines without WebGL access.
         const faceDetector = await create("GPU").catch(() => create("CPU"));
@@ -221,62 +230,90 @@ function TrackedCameraFeed({ stream, image, title, onCrossing }: { stream: Media
       } catch { return; }
 
       const vw = video.videoWidth, vh = video.videoHeight;
-      const found = detections
+      const found: FaceBox[] = detections
         .map(d => ({ bb: d.boundingBox, score: d.categories?.[0]?.score ?? 0 }))
-        .filter(d => !!d.bb && d.score > 0.62)
+        .filter(d => !!d.bb && d.score >= 0.68)
         .map(d => {
-          const bb = d.bb!;
-          // Expand the face box slightly into a head-and-shoulders box.
-          const w = (bb.width / vw) * 100 * 1.25;
-          const h = (bb.height / vh) * 100 * 1.35;
-          const x = (bb.originX / vw) * 100 - (w - (bb.width / vw) * 100) / 2;
-          const y = (bb.originY / vh) * 100 - (h - (bb.height / vh) * 100) / 2;
+          const bb = d.bb;
+          if (!bb) return null;
+          const faceW = (bb.width / vw) * 100;
+          const faceH = (bb.height / vh) * 100;
+          const rawX = (bb.originX / vw) * 100 - faceW * 0.125;
+          const rawY = (bb.originY / vh) * 100 - faceH * 0.12;
+          const x = Math.max(0, rawX);
+          const y = Math.max(0, rawY);
+          const w = Math.min(100 - x, faceW * 1.25);
+          const h = Math.min(100 - y, faceH * 1.35);
           return { x, y, w, h, cx: x + w / 2, cy: y + h / 2, score: d.score };
         })
-        .filter(d => d.w > 3 && d.h > 4); // ignore sub-pixel false positives
+        .filter((d): d is FaceBox => d !== null)
+        .filter(d => d.w >= 4.5 && d.h >= 5 && d.w <= 58 && d.h <= 70 && d.w / d.h >= 0.55 && d.w / d.h <= 1.25);
 
-      // Nearest-neighbour matching keeps a stable customer number per face.
-      const open = [...tracks.current];
+      // Build all plausible pairings, then take the lowest-cost one-to-one matches.
+      // Predicted centers preserve IDs through short occlusions and crossing paths.
+      const previous = tracks.current;
+      const candidates: { ti: number; di: number; cost: number }[] = [];
+      previous.forEach((track, ti) => found.forEach((d, di) => {
+        const predictedX = track.cx + track.vx * Math.min(track.missed + 1, 4);
+        const predictedY = track.cy + track.vy * Math.min(track.missed + 1, 4);
+        const distance = Math.hypot(predictedX - d.cx, predictedY - d.cy) / Math.max(6, (track.box.w + d.w) / 2);
+        const overlap = boxOverlap(track.box, d);
+        const scale = Math.max(track.box.w / d.w, d.w / track.box.w, track.box.h / d.h, d.h / track.box.h);
+        if ((overlap >= 0.04 || distance <= 1.45) && scale <= 2.1) candidates.push({ ti, di, cost: distance + (1 - overlap) * 0.7 + (scale - 1) * 0.35 });
+      }));
+      candidates.sort((a, b) => a.cost - b.cost);
+      const usedTracks = new Set<number>();
+      const usedDetections = new Set<number>();
       const live: Track[] = [];
-      for (const d of found) {
-        let best: Track | null = null;
-        let bestDist = Math.max(12, d.w * 1.4);
-        for (const t of open) {
-          const dist = Math.hypot(t.cx - d.cx, t.cy - d.cy);
-          if (dist < bestDist) { bestDist = dist; best = t; }
-        }
-        const confidence = Math.round(d.score * 100);
-        if (best) {
-          open.splice(open.indexOf(best), 1);
-          // Smoothing on both position and size removes the box jitter.
-          const s = 0.4;
-          best.cx += (d.cx - best.cx) * s;
-          best.cy += (d.cy - best.cy) * s;
-          const b = best.box;
-          best.box = {
-            id: best.id,
-            x: b.x + (d.x - b.x) * s,
-            y: b.y + (d.y - b.y) * s,
-            w: b.w + (d.w - b.w) * s,
-            h: b.h + (d.h - b.h) * s,
-            confidence: Math.round(b.confidence + (confidence - b.confidence) * 0.3),
-          };
-          best.hits += 1;
-          best.missed = 0;
-          live.push(best);
-        } else {
-          const id = nextId.current;
-          live.push({ id, cx: d.cx, cy: d.cy, box: { id, x: d.x, y: d.y, w: d.w, h: d.h, confidence }, hits: 1, missed: 0, side: null, lastCross: 0 });
-        }
+      for (const match of candidates) {
+        if (usedTracks.has(match.ti) || usedDetections.has(match.di)) continue;
+        const track = previous[match.ti];
+        const d = found[match.di];
+        if (!track || !d) continue;
+        usedTracks.add(match.ti);
+        usedDetections.add(match.di);
+        const dx = d.cx - track.cx, dy = d.cy - track.cy;
+        track.vx = track.vx * 0.55 + dx * 0.45;
+        track.vy = track.vy * 0.55 + dy * 0.45;
+        const motion = Math.hypot(dx, dy) / Math.max(d.w, 1);
+        const smoothing = motion < 0.08 ? 0.18 : motion < 0.35 ? 0.34 : 0.55;
+        track.cx += dx * smoothing;
+        track.cy += dy * smoothing;
+        track.box = {
+          x: track.box.x + (d.x - track.box.x) * smoothing,
+          y: track.box.y + (d.y - track.box.y) * smoothing,
+          w: track.box.w + (d.w - track.box.w) * Math.max(0.2, smoothing - 0.08),
+          h: track.box.h + (d.h - track.box.h) * Math.max(0.2, smoothing - 0.08),
+          confidence: Math.round(track.box.confidence * 0.7 + d.score * 100 * 0.3),
+        };
+        track.streak += 1;
+        track.age += 1;
+        track.missed = 0;
+        track.quality = track.quality * 0.75 + d.score * 0.25;
+        if (track.customerId === null && track.streak >= 5 && track.quality >= 0.7) track.customerId = nextCustomerId.current++;
+        live.push(track);
       }
-      // Keep briefly-lost faces alive so a blink or turn doesn't renumber them.
-      for (const t of open) { t.missed += 1; if (t.missed < 12) live.push(t); }
+      found.forEach((d, di) => {
+        if (usedDetections.has(di)) return;
+        live.push({ uid: nextTrackUid.current++, customerId: null, cx: d.cx, cy: d.cy, vx: 0, vy: 0, box: { x: d.x, y: d.y, w: d.w, h: d.h, confidence: Math.round(d.score * 100) }, streak: 1, age: 1, missed: 0, quality: d.score, side: null, lastCross: 0 });
+      });
+      previous.forEach((track, ti) => {
+        if (usedTracks.has(ti)) return;
+        track.missed += 1;
+        track.streak = 0;
+        track.age += 1;
+        track.cx += track.vx;
+        track.cy += track.vy;
+        track.box.x = Math.max(0, Math.min(100 - track.box.w, track.box.x + track.vx));
+        track.box.y = Math.max(0, Math.min(100 - track.box.h, track.box.y + track.vy));
+        track.vx *= 0.82;
+        track.vy *= 0.82;
+        if (track.missed <= (track.customerId === null ? 3 : 10)) live.push(track);
+      });
       tracks.current = live;
 
-      // A track must be seen in 3 consecutive frames before it becomes a customer.
-      for (const t of live) if (t.hits === 3 && t.id === nextId.current) nextId.current += 1;
-      const confirmed = live.filter(t => t.hits >= 3 && t.missed < 5);
-      setBoxes(confirmed.map(t => t.box));
+      const confirmed = live.filter(t => t.customerId !== null && t.missed < 4 && t.quality >= 0.66);
+      setBoxes(confirmed.map(t => ({ ...t.box, id: t.customerId ?? 0 })));
 
       const center = 50;
       const margin = 8; // hysteresis band around the tripwire
@@ -289,7 +326,7 @@ function TrackedCameraFeed({ stream, image, title, onCrossing }: { stream: Media
         if (before === null || before === currentSide) continue;
         if (time - t.lastCross < 900) continue;
         t.lastCross = time;
-        onCrossing(currentSide === 1 ? "in" : "out");
+        crossingHandler.current(currentSide === 1 ? "in" : "out");
       }
     }
 
@@ -299,7 +336,7 @@ function TrackedCameraFeed({ stream, image, title, onCrossing }: { stream: Media
       detector?.close();
       tracks.current = [];
     };
-  }, [stream, onCrossing]);
+  }, [stream]);
 
   const statusLabel = !stream ? "CAMERA READY" : status === "loading" ? "LOADING FACE AI" : status === "error" ? "FACE AI UNAVAILABLE" : boxes.length ? `TRACKING ${boxes.length} PERSON${boxes.length > 1 ? "S" : ""}` : "SCANNING FOR FACES";
 

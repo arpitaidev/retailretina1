@@ -459,14 +459,35 @@ function Inventory({ stockout, setStockout }: { stockout: boolean; setStockout: 
 
 function Queues({ rush, setRush }: { rush: boolean; setRush: (v: boolean) => void }) {
   const [counter4, setCounter4] = useState(false);
+  const [staffByCounter, setStaffByCounter] = useState<Record<number, number>>({ 1: 2, 2: 2, 3: 2, 4: 0, 5: 2, 6: 0 });
+  const [fromCounter, setFromCounter] = useState(1);
+  const [toCounter, setToCounter] = useState(4);
+  const [transferNote, setTransferNote] = useState<string | null>(null);
   const overloaded = rush && !counter4;
   const counters = [
-    [1, true, overloaded ? 9 : 3, overloaded ? "4m 12s" : "1m 22s"], [2, true, overloaded ? 11 : 4, overloaded ? "5m 08s" : "1m 48s"], [3, true, overloaded ? 8 : 2, overloaded ? "3m 44s" : "0m 58s"], [4, counter4, counter4 ? 2 : 0, counter4 ? "0m 52s" : "—"], [5, true, overloaded ? 7 : 3, overloaded ? "3m 18s" : "1m 36s"], [6, false, 0, "—"],
+    [1, staffByCounter[1] > 0, overloaded ? 9 : 3, overloaded ? "4m 12s" : "1m 22s"], [2, staffByCounter[2] > 0, overloaded ? 11 : 4, overloaded ? "5m 08s" : "1m 48s"], [3, staffByCounter[3] > 0, overloaded ? 8 : 2, overloaded ? "3m 44s" : "0m 58s"], [4, staffByCounter[4] > 0, staffByCounter[4] > 0 ? 2 : 0, staffByCounter[4] > 0 ? "0m 52s" : "—"], [5, staffByCounter[5] > 0, overloaded ? 7 : 3, overloaded ? "3m 18s" : "1m 36s"], [6, staffByCounter[6] > 0, staffByCounter[6] > 0 ? 2 : 0, staffByCounter[6] > 0 ? "0m 49s" : "—"],
   ];
+  const transferEmployee = () => {
+    if (fromCounter === toCounter || (staffByCounter[fromCounter] ?? 0) < 1) return;
+    setStaffByCounter(current => ({ ...current, [fromCounter]: (current[fromCounter] ?? 0) - 1, [toCounter]: (current[toCounter] ?? 0) + 1 }));
+    if (toCounter === 4) setCounter4(true);
+    if (fromCounter === 4 && staffByCounter[4] === 1) setCounter4(false);
+    setTransferNote(`Employee transferred from Counter ${fromCounter} to Counter ${toCounter}.`);
+  };
   return <div className="space-y-5">
-    {overloaded && <div className="rounded-md border border-warning/50 bg-warning-soft p-5"><div className="flex flex-col gap-4 sm:flex-row sm:items-center"><div className="flex size-10 items-center justify-center rounded-md bg-warning text-primary-foreground"><AlertTriangle/></div><div className="flex-1"><div className="text-sm font-extrabold">Queue Spike Warning</div><div className="mt-1 text-xs text-muted-foreground">Inflow at Entrance increased by 40%. Open Counter 4 in 3 minutes to prevent waits exceeding 5 minutes.</div></div><Button onClick={() => setCounter4(true)}><UserRoundCheck/>Open Counter 4 Now</Button></div></div>}
+    {overloaded && <div className="rounded-md border border-warning/50 bg-warning-soft p-5"><div className="flex flex-col gap-4 sm:flex-row sm:items-center"><div className="flex size-10 items-center justify-center rounded-md bg-warning text-primary-foreground"><AlertTriangle/></div><div className="flex-1"><div className="text-sm font-extrabold">Queue Spike Warning</div><div className="mt-1 text-xs text-muted-foreground">Inflow at Entrance increased by 40%. Open Counter 4 in 3 minutes to prevent waits exceeding 5 minutes.</div></div><Button onClick={() => { setCounter4(true); setStaffByCounter(current => ({ ...current, 4: Math.max(1, current[4] ?? 0) })); }}><UserRoundCheck/>Open Counter 4 Now</Button></div></div>}
     {counter4 && <div className="flex items-center gap-3 rounded-md border border-optimal/40 bg-optimal-soft p-4 text-sm font-bold text-optimal"><Check/>Counter 4 opened. Average wait projected to normalize in 4 minutes.<Button variant="ghost" size="sm" className="ml-auto" onClick={() => { setRush(false); setCounter4(false); }}>Resolve</Button></div>}
-    <div className="rounded-md border border-border bg-card p-4"><SectionTitle icon={Users} title="Live Checkout Line Monitor" note="Wait-time inference updates every 2 seconds"/><div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">{counters.map(([id, open, queue, wait]) => <div key={String(id)} className={`rounded-md border p-4 ${open ? "border-border bg-background" : "border-border bg-muted/40"}`}><div className="flex items-center justify-between"><div className="text-sm font-extrabold">Counter {id}</div><span className={`flex items-center gap-1.5 text-[10px] font-bold ${open ? "text-optimal" : "text-muted-foreground"}`}><span className={`size-1.5 rounded-full ${open ? "bg-optimal" : "bg-muted-foreground"}`}/>{open ? "OPEN" : "CLOSED"}</span></div><div className="mt-5 grid grid-cols-2 divide-x divide-border"><div><div className="text-2xl font-extrabold">{queue}</div><div className="text-[10px] text-muted-foreground">People in queue</div></div><div className="pl-4"><div className={`text-2xl font-extrabold ${Number(queue) > 6 ? "text-critical" : ""}`}>{wait}</div><div className="text-[10px] text-muted-foreground">Est. wait</div></div></div></div>)}</div></div>
+    <div className="rounded-md border border-border bg-card p-4"><SectionTitle icon={Users} title="Live Checkout Line Monitor" note="Wait-time inference updates every 2 seconds"/><div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">{counters.map(([id, open, queue, wait]) => <div key={String(id)} className={`rounded-md border p-4 ${open ? "border-border bg-background" : "border-border bg-muted/40"}`}><div className="flex items-center justify-between"><div className="text-sm font-extrabold">Counter {id}</div><span className={`flex items-center gap-1.5 text-[10px] font-bold ${open ? "text-optimal" : "text-muted-foreground"}`}><span className={`size-1.5 rounded-full ${open ? "bg-optimal" : "bg-muted-foreground"}`}/>{open ? "OPEN" : "CLOSED"}</span></div><div className="mt-5 grid grid-cols-3 divide-x divide-border"><div><div className="text-2xl font-extrabold">{queue}</div><div className="text-[10px] text-muted-foreground">People in queue</div></div><div className="px-3"><div className={`text-2xl font-extrabold ${Number(queue) > 6 ? "text-critical" : ""}`}>{wait}</div><div className="text-[10px] text-muted-foreground">Est. wait</div></div><div className="pl-3"><div className="text-2xl font-extrabold">{staffByCounter[Number(id)] ?? 0}</div><div className="text-[10px] text-muted-foreground">Employees</div></div></div></div>)}</div></div>
+    <div className="rounded-md border border-border bg-card p-4">
+      <SectionTitle icon={MoveRight} title="Transfer Employee" note="Reassign an available checkout employee immediately"/>
+      <div className="grid gap-3 sm:grid-cols-[1fr_auto_1fr_auto] sm:items-end">
+        <label className="text-[10px] font-bold uppercase text-muted-foreground">From counter<select aria-label="Transfer employee from counter" value={fromCounter} onChange={event => setFromCounter(Number(event.target.value))} className="mt-1.5 h-10 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring">{[1,2,3,4,5,6].map(id => <option key={id} value={id} disabled={(staffByCounter[id] ?? 0) < 1}>Counter {id} · {staffByCounter[id] ?? 0} staff</option>)}</select></label>
+        <MoveRight className="mb-2 hidden size-5 text-muted-foreground sm:block"/>
+        <label className="text-[10px] font-bold uppercase text-muted-foreground">To counter<select aria-label="Transfer employee to counter" value={toCounter} onChange={event => setToCounter(Number(event.target.value))} className="mt-1.5 h-10 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring">{[1,2,3,4,5,6].map(id => <option key={id} value={id}>Counter {id} · {staffByCounter[id] ?? 0} staff</option>)}</select></label>
+        <Button onClick={transferEmployee} disabled={fromCounter === toCounter || (staffByCounter[fromCounter] ?? 0) < 1}><UserRoundCheck/>Transfer Now</Button>
+      </div>
+      {transferNote && <div className="mt-3 flex items-center gap-2 rounded-md border border-optimal/40 bg-optimal-soft px-3 py-2 text-xs font-bold text-optimal"><Check className="size-4"/>{transferNote}</div>}
+    </div>
     <StaffingMap rush={rush} counter4={counter4}/>
   </div>;
 }
@@ -502,6 +523,7 @@ function trafficColor(t: number) {
 }
 const hourLabels = ["8a","9a","10a","11a","12p","1p","2p","3p","4p","5p","6p","7p","8p","9p","10p","11p"];
 const weekdayTraffic = [["Mon",1980],["Tue",2140],["Wed",2260],["Thu",2480],["Fri",3120],["Sat",3860],["Sun",3410]] as const;
+const yearlyTraffic = [["Jan",68400],["Feb",71200],["Mar",75800],["Apr",73100],["May",79600],["Jun",84500],["Jul",89200],["Aug",93400],["Sep",88100],["Oct",97200],["Nov",108600],["Dec",121400]] as const;
 const riskItems = [
   ["Organic Whole Milk 1L", "SKU 41987", 46, 22, 3],
   ["Sparkling Water 8pk", "SKU 51903", 18, 12, 4],
@@ -515,6 +537,7 @@ function TrafficStaffing({ rush, activeShoppers }: { rush: boolean; activeShoppe
   const peakIndex = traffic.indexOf(Math.max(...traffic));
   const maxTraffic = Math.max(...traffic);
   const maxWeek = Math.max(...weekdayTraffic.map(([, v]) => v));
+  const maxYear = Math.max(...yearlyTraffic.map(([, v]) => v));
   const staffPlan = traffic.map(v => Math.max(4, Math.round(v / 42)));
   return <div className="space-y-5">
     <div className="grid gap-4 md:grid-cols-3">
@@ -530,12 +553,16 @@ function TrafficStaffing({ rush, activeShoppers }: { rush: boolean; activeShoppe
     <div className="grid gap-4 xl:grid-cols-2">
       <div className="rounded-md border border-border bg-card p-4">
         <SectionTitle icon={CalendarDays} title="Weekly Demand Pattern" note="Total visitors by weekday"/>
-        <div className="space-y-3">{weekdayTraffic.map(([day, v]) => <div key={day} className="grid grid-cols-[46px_1fr_auto] items-center gap-3"><span className="text-xs font-bold">{day}</span><div className="h-6 overflow-hidden rounded-sm bg-muted"><div className={`h-full ${v === maxWeek ? "bg-critical" : "bg-insight"}`} style={{ width: `${(v / maxWeek) * 100}%` }}/></div><span className="font-mono text-[10px] text-muted-foreground">{v}</span></div>)}</div>
+        <div className="space-y-3">{weekdayTraffic.map(([day, v]) => { const intensity = v / maxWeek; return <div key={day} className="grid grid-cols-[46px_1fr_auto] items-center gap-3"><span className="text-xs font-bold">{day}</span><div className="h-6 overflow-hidden rounded-sm bg-muted"><div className="h-full rounded-r-sm transition-all" style={{ width: `${intensity * 100}%`, backgroundColor: trafficColor(intensity) }}/></div><span className="font-mono text-[10px]" style={{ color: trafficColor(intensity) }}>{v}</span></div>; })}</div>
       </div>
       <div className="rounded-md border border-border bg-card p-4">
         <SectionTitle icon={UserRoundCheck} title="Predictive Staffing Heatmap" note="Associates recommended per hour"/>
         <div className="grid grid-cols-7 gap-1.5">{staffPlan.map((s, i) => { const intensity = s / Math.max(...staffPlan); const tone = intensity > 0.85 ? "bg-critical-soft text-critical border-critical/40" : intensity > 0.6 ? "bg-warning-soft text-warning border-warning/40" : "bg-optimal-soft text-optimal border-optimal/40"; return <div key={hourLabels[i]} className={`rounded-sm border p-2 text-center ${tone}`}><div className="text-[9px] font-bold">{hourLabels[i]}</div><div className="text-sm font-extrabold">{s}</div></div>; })}</div>
       </div>
+    </div>
+    <div className="rounded-md border border-border bg-card p-4">
+      <SectionTitle icon={CalendarDays} title="Yearly Traffic" note="Monthly visitor totals for the current year"/>
+      <div className="flex h-64 items-stretch gap-2 overflow-x-auto pb-1">{yearlyTraffic.map(([month, value]) => { const intensity = value / maxYear; return <div key={month} className="flex h-full min-w-10 flex-1 flex-col items-center gap-1"><span className="font-mono text-[9px]" style={{ color: trafficColor(intensity) }}>{Math.round(value / 1000)}k</span><div className="relative w-full flex-1"><div className="absolute inset-x-0 bottom-0 rounded-t-sm transition-all" style={{ height: `${intensity * 100}%`, backgroundColor: trafficColor(intensity) }} title={`${month}: ${value.toLocaleString()} visitors`}/></div><span className="text-[9px] text-muted-foreground">{month}</span></div>; })}</div>
     </div>
     <HighRiskInventory rush={rush}/>
   </div>;

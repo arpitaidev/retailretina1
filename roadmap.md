@@ -7,3 +7,4 @@
 - [ ] Add a predictive High-Risk Inventory report using stock, sales velocity, and shipment timing.
 - [ ] Verify metadata, desktop/mobile layouts, camera controls, and live interactions.
 - [x] Add yearly traffic reporting, traffic-based weekly colors, and counter staff transfers.
+- [ ] Refine live face tracking stability, matching, and false-positive rejection.

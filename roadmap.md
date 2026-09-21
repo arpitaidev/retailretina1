@@ -6,3 +6,4 @@
 - [ ] Add bidirectional tripwire counting and connect it to Active Shoppers.
 - [ ] Add a predictive High-Risk Inventory report using stock, sales velocity, and shipment timing.
 - [ ] Verify metadata, desktop/mobile layouts, camera controls, and live interactions.
+- [x] Add yearly traffic reporting, traffic-based weekly colors, and counter staff transfers.

@@ -465,7 +465,7 @@ function Queues({ rush, setRush }: { rush: boolean; setRush: (v: boolean) => voi
   const [transferNote, setTransferNote] = useState<string | null>(null);
   const overloaded = rush && !counter4;
   const counters = [
-    [1, staffByCounter[1] > 0, overloaded ? 9 : 3, overloaded ? "4m 12s" : "1m 22s"], [2, staffByCounter[2] > 0, overloaded ? 11 : 4, overloaded ? "5m 08s" : "1m 48s"], [3, staffByCounter[3] > 0, overloaded ? 8 : 2, overloaded ? "3m 44s" : "0m 58s"], [4, staffByCounter[4] > 0, staffByCounter[4] > 0 ? 2 : 0, staffByCounter[4] > 0 ? "0m 52s" : "—"], [5, staffByCounter[5] > 0, overloaded ? 7 : 3, overloaded ? "3m 18s" : "1m 36s"], [6, staffByCounter[6] > 0, staffByCounter[6] > 0 ? 2 : 0, staffByCounter[6] > 0 ? "0m 49s" : "—"],
+    [1, (staffByCounter[1] ?? 0) > 0, overloaded ? 9 : 3, overloaded ? "4m 12s" : "1m 22s"], [2, (staffByCounter[2] ?? 0) > 0, overloaded ? 11 : 4, overloaded ? "5m 08s" : "1m 48s"], [3, (staffByCounter[3] ?? 0) > 0, overloaded ? 8 : 2, overloaded ? "3m 44s" : "0m 58s"], [4, (staffByCounter[4] ?? 0) > 0, (staffByCounter[4] ?? 0) > 0 ? 2 : 0, (staffByCounter[4] ?? 0) > 0 ? "0m 52s" : "—"], [5, (staffByCounter[5] ?? 0) > 0, overloaded ? 7 : 3, overloaded ? "3m 18s" : "1m 36s"], [6, (staffByCounter[6] ?? 0) > 0, (staffByCounter[6] ?? 0) > 0 ? 2 : 0, (staffByCounter[6] ?? 0) > 0 ? "0m 49s" : "—"],
   ];
   const transferEmployee = () => {
     if (fromCounter === toCounter || (staffByCounter[fromCounter] ?? 0) < 1) return;
